@@ -587,6 +587,9 @@ class Database:
         defaults = {
             "maintenance_mode": "0",
             "auto_message_enabled": "1",
+            # New additive feature. Disabled by default so existing behavior
+            # remains unchanged after deployment.
+            "auto_member_enabled": "0",
             "start_message": "Please join our channel to continue.",
             "start_button_text": "JOIN NOW",
             "start_button_style": "primary",
@@ -944,19 +947,9 @@ def is_owner_for(db: Database, user_id: Optional[int], owner_id: int) -> bool:
 # KEYBOARDS
 # ============================================================
 
-# NOTE: Telegram's Bot API has no concept of button "color"/"style" — every
-# InlineKeyboardButton renders the same regardless. `style` is kept as an
-# app-level concept only (used to pick a leading emoji below) and must NEVER
-# be forwarded into InlineKeyboardButton(), which does not accept it.
-_STYLE_EMOJI_PREFIX = {"success": "✅ ", "danger": "🛑 ", "primary": ""}
-
-
 def _make_inline_button(text: str, url: str, style: Optional[str] = None,
                         icon_custom_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
-    style = normalize_button_style(style)
-    prefix = _STYLE_EMOJI_PREFIX.get(style, "")
-    label = text[:64] if text.startswith(tuple(p for p in _STYLE_EMOJI_PREFIX.values() if p)) else f"{prefix}{text}"[:64]
-    kwargs = {"text": label, "url": url}
+    kwargs = {"text": text[:64], "url": url, "style": normalize_button_style(style)}
     if icon_custom_emoji_id:
         kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
     return InlineKeyboardButton(**kwargs)
@@ -964,10 +957,7 @@ def _make_inline_button(text: str, url: str, style: Optional[str] = None,
 
 def _make_callback_button(text: str, callback_data: str, style: Optional[str] = None,
                           icon_custom_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
-    style = normalize_button_style(style)
-    prefix = _STYLE_EMOJI_PREFIX.get(style, "")
-    label = text[:64] if text.startswith(tuple(p for p in _STYLE_EMOJI_PREFIX.values() if p)) else f"{prefix}{text}"[:64]
-    kwargs = {"text": label, "callback_data": callback_data}
+    kwargs = {"text": text[:64], "callback_data": callback_data, "style": normalize_button_style(style)}
     if icon_custom_emoji_id:
         kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
     return InlineKeyboardButton(**kwargs)
@@ -1810,7 +1800,10 @@ class BotInstance:
                     error = clean_error(exc)
                     self.db.log_error("ERROR", "join_request", "send_failed", error)
                     self.db.update_join_request(row_id, sent=False, status="failed", error=error)
-            if channel["auto_approve"]:
+            # New Auto Member switch is global to this bot instance. The
+            # existing per-channel Auto Approve feature remains supported.
+            auto_member_enabled = self.db.get_setting("auto_member_enabled", "0") == "1"
+            if auto_member_enabled or bool(channel["auto_approve"]):
                 try:
                     await context.bot.approve_chat_join_request(chat_id=chat.id, user_id=user.id)
                     self.db.log_event("join_request_auto_approved", user.id, chat.id)
@@ -2022,11 +2015,17 @@ class BotInstance:
         await query.edit_message_text(
             (
                 "📩 JOIN REQUEST SETTINGS\n\n"
-                f"Auto Message: {'ON' if enabled == '1' else 'OFF'}\n\n"
-                "Only enabled/configured channels are processed.\n"
-                "Auto Approve is controlled per channel from Channel Manager."
+                f"Auto Message: {'ON' if enabled == '1' else 'OFF'}\n"
+                f"Auto Member: {'ON' if self.db.get_setting('auto_member_enabled', '0') == '1' else 'OFF'}\n\n"
+                "When Auto Member is ON, incoming join requests for every enabled configured channel are accepted automatically.\n"
+                "Existing per-channel Auto Approve remains available in Channel Manager."
             ),
             reply_markup=InlineKeyboardMarkup([
+                [_make_callback_button(
+                    ("👥 Auto Member: ON" if self.db.get_setting("auto_member_enabled", "0") == "1" else "👥 Auto Member: OFF"),
+                    "toggle_auto_member",
+                    "success" if self.db.get_setting("auto_member_enabled", "0") == "1" else "danger",
+                )],
                 [_make_callback_button("Toggle Auto Message", "toggle_auto", "primary")],
                 [_make_callback_button("✅ Approve All Pending", "join_approve_all", "success"),
                  _make_callback_button("❌ Reject All Pending", "join_reject_all", "danger")],
@@ -2089,13 +2088,7 @@ class BotInstance:
         channels = self.db.get_channels()
         lines = ["📢 CHANNEL MANAGER\n"]
         if not channels:
-            lines.append(
-                "No channels configured yet.\n\n"
-                "Tap ➕ Add Channel below, then send the channel @username or "
-                "numeric ID (bot must be admin there).\n\n"
-                "Once added, an Auto Approve ON/OFF button appears next to that "
-                "channel — turn it ON to auto-accept join requests."
-            )
+            lines.append("No channels configured.")
         else:
             for channel in channels:
                 status = "ON" if channel["enabled"] else "OFF"
@@ -2384,6 +2377,36 @@ class BotInstance:
             if data == "admin_test":
                 await self.test_message(query, context); return
 
+            if data == "toggle_auto_member":
+                current = self.db.get_setting("auto_member_enabled", "0")
+                new_value = "0" if current == "1" else "1"
+                if new_value == "1":
+                    channels = self.db.get_channels(enabled_only=True)
+                    if not channels:
+                        await query.answer("Add and enable a channel first.", show_alert=True)
+                        return
+                    permission_ok = False
+                    for channel in channels:
+                        try:
+                            member = await context.bot.get_chat_member(
+                                chat_id=channel["channel_id"], user_id=context.bot.id
+                            )
+                            status = str(getattr(member, "status", ""))
+                            can_invite = getattr(member, "can_invite_users", None)
+                            if status == "creator" or (status == "administrator" and can_invite is True):
+                                permission_ok = True
+                                break
+                        except TelegramError:
+                            continue
+                    if not permission_ok:
+                        await query.answer(
+                            "Bot needs admin + Invite Users permission in at least one enabled channel.",
+                            show_alert=True,
+                        )
+                        return
+                self.db.set_setting("auto_member_enabled", new_value)
+                self.db.log_event("auto_member_toggled", user_id=query.from_user.id, details=f"enabled={new_value}")
+                await self.show_join_settings(query); return
             if data == "toggle_auto":
                 current = self.db.get_setting("auto_message_enabled", "1")
                 self.db.set_setting("auto_message_enabled", "0" if current == "1" else "1")
@@ -3860,13 +3883,19 @@ async def show_bot_manage_page(query, inst: "BotInstance"):
         f"👥 Users: {s['users']}  |  🟢 Active: {s['active']}  |  🚫 Blocked: {s['blocked']}\n"
         f"📩 Join Requests: {s['requests']}\n"
         f"📢 Broadcasts: {s['broadcasts']}\n"
-        f"📅 Channels: {s['channels']}\n\n"
+        f"📅 Channels: {s['channels']}\n"
+        f"👥 Auto Member: {'ON' if inst.db.get_setting('auto_member_enabled', '0') == '1' else 'OFF'}\n\n"
         "Token is never displayed."
     )
     keyboard = InlineKeyboardMarkup([
         [_make_callback_button("📊 Stats", f"bm:{inst.bot_id}:stats", "primary"),
          _make_callback_button("📢 Broadcast", f"bm:{inst.bot_id}:broadcast", "primary")],
         [_make_callback_button("⚙️ Manage (open child admin)", f"bm:{inst.bot_id}:open", "primary")],
+        [_make_callback_button(
+            ("👥 Auto Member: ON" if inst.db.get_setting("auto_member_enabled", "0") == "1" else "👥 Auto Member: OFF"),
+            f"bm:{inst.bot_id}:auto_member",
+            "success" if inst.db.get_setting("auto_member_enabled", "0") == "1" else "danger",
+        )],
         [
             _make_callback_button("⏸ Stop", f"bm:{inst.bot_id}:stop", "danger") if inst.status == "live"
             else _make_callback_button("▶️ Start", f"bm:{inst.bot_id}:start", "success"),
@@ -4484,6 +4513,45 @@ async def main_admin_callback_extension(main_inst: "BotInstance", update: Update
             await query.message.reply_text("Invalid bot action.")
             return True
         inst = bm.children.get(bot_id)
+        if action == "auto_member":
+            if not inst:
+                await query.message.reply_text("Bot not found.")
+                return True
+            if inst.application is None:
+                await query.answer("Child bot is not running.", show_alert=True)
+                return True
+            current = inst.db.get_setting("auto_member_enabled", "0")
+            new_value = "0" if current == "1" else "1"
+            if new_value == "1":
+                channels = inst.db.get_channels(enabled_only=True)
+                if not channels:
+                    await query.answer("This child bot has no enabled channels.", show_alert=True)
+                    return True
+                permission_ok = False
+                for channel in channels:
+                    try:
+                        member = await inst.application.bot.get_chat_member(
+                            chat_id=channel["channel_id"], user_id=inst.application.bot.id
+                        )
+                        status = str(getattr(member, "status", ""))
+                        can_invite = getattr(member, "can_invite_users", None)
+                        if status == "creator" or (status == "administrator" and can_invite is True):
+                            permission_ok = True
+                            break
+                    except TelegramError:
+                        continue
+                if not permission_ok:
+                    await query.answer(
+                        "Child bot needs admin + Invite Users permission in an enabled channel.",
+                        show_alert=True,
+                    )
+                    return True
+            inst.db.set_setting("auto_member_enabled", new_value)
+            inst.db.log_event("auto_member_toggled_by_main_owner", user.id, details=f"enabled={new_value}")
+            main_inst.db.log_master_audit(user.id, bot_id, "auto_member_toggled", "ok", f"enabled={new_value}")
+            await query.answer(f"Auto Member {'ON' if new_value == '1' else 'OFF'}")
+            await show_bot_manage_page(query, inst)
+            return True
         if action == "manage":
             if not inst:
                 await query.message.reply_text("Bot not found.")
