@@ -1,3 +1,19 @@
+# ============================================================
+# NEW FEATURES / HARDENING
+# ============================================================
+# 1) Master Broadcast through Child Bot now has the full draft composer:
+#    text/media, Premium/custom emoji entities, multiple styled buttons,
+#    preview, clear buttons, and Send Now; delivery uses the CHILD bot token
+#    and CHILD database. Media sent from the Main bot is staged safely so it
+#    can be uploaded by the Child bot.
+# 2) Join Request Manager now supports per-channel Auto-Approve plus
+#    Approve All Pending and Reject/Cancel All Pending actions.
+# 3) Bot Creator permissions now persist max_bots limits, enforce those limits,
+#    and provide Owner-only Edit Limit and Revoke controls.
+# 4) Database migrations are backward-compatible for existing installations;
+#    child failures are isolated and bot tokens are never logged.
+# ============================================================
+
 import asyncio
 import csv
 import hashlib
@@ -947,20 +963,38 @@ def is_owner_for(db: Database, user_id: Optional[int], owner_id: int) -> bool:
 # KEYBOARDS
 # ============================================================
 
+def _safe_inline_keyboard_button(*, text: str, style: Optional[str] = None,
+                               icon_custom_emoji_id: Optional[str] = None, **kwargs) -> InlineKeyboardButton:
+    """Create a Telegram inline button without breaking older PTB versions.
+
+    Button `style` is application metadata only. It is deliberately not sent
+    to InlineKeyboardButton because the deployed python-telegram-bot version
+    rejects that argument. Custom emoji icon support is best-effort.
+    """
+    _ = normalize_button_style(style)
+    base = {"text": text[:64], **kwargs}
+    if icon_custom_emoji_id:
+        try:
+            return InlineKeyboardButton(**base, icon_custom_emoji_id=str(icon_custom_emoji_id))
+        except TypeError as exc:
+            if "icon_custom_emoji_id" not in str(exc):
+                raise
+    return InlineKeyboardButton(**base)
+
+
 def _make_inline_button(text: str, url: str, style: Optional[str] = None,
                         icon_custom_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
-    kwargs = {"text": text[:64], "url": url, "style": normalize_button_style(style)}
-    if icon_custom_emoji_id:
-        kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
-    return InlineKeyboardButton(**kwargs)
+    return _safe_inline_keyboard_button(
+        text=text, url=url, style=style, icon_custom_emoji_id=icon_custom_emoji_id
+    )
 
 
 def _make_callback_button(text: str, callback_data: str, style: Optional[str] = None,
                           icon_custom_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
-    kwargs = {"text": text[:64], "callback_data": callback_data, "style": normalize_button_style(style)}
-    if icon_custom_emoji_id:
-        kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
-    return InlineKeyboardButton(**kwargs)
+    return _safe_inline_keyboard_button(
+        text=text, callback_data=callback_data, style=style,
+        icon_custom_emoji_id=icon_custom_emoji_id
+    )
 
 
 def build_keyboard(buttons):
