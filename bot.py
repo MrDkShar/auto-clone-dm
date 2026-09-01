@@ -1,19 +1,3 @@
-# ============================================================
-# NEW FEATURES / HARDENING
-# ============================================================
-# 1) Master Broadcast through Child Bot now has the full draft composer:
-#    text/media, Premium/custom emoji entities, multiple styled buttons,
-#    preview, clear buttons, and Send Now; delivery uses the CHILD bot token
-#    and CHILD database. Media sent from the Main bot is staged safely so it
-#    can be uploaded by the Child bot.
-# 2) Join Request Manager now supports per-channel Auto-Approve plus
-#    Approve All Pending and Reject/Cancel All Pending actions.
-# 3) Bot Creator permissions now persist max_bots limits, enforce those limits,
-#    and provide Owner-only Edit Limit and Revoke controls.
-# 4) Database migrations are backward-compatible for existing installations;
-#    child failures are isolated and bot tokens are never logged.
-# ============================================================
-
 import asyncio
 import csv
 import hashlib
@@ -960,9 +944,19 @@ def is_owner_for(db: Database, user_id: Optional[int], owner_id: int) -> bool:
 # KEYBOARDS
 # ============================================================
 
+# NOTE: Telegram's Bot API has no concept of button "color"/"style" — every
+# InlineKeyboardButton renders the same regardless. `style` is kept as an
+# app-level concept only (used to pick a leading emoji below) and must NEVER
+# be forwarded into InlineKeyboardButton(), which does not accept it.
+_STYLE_EMOJI_PREFIX = {"success": "✅ ", "danger": "🛑 ", "primary": ""}
+
+
 def _make_inline_button(text: str, url: str, style: Optional[str] = None,
                         icon_custom_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
-    kwargs = {"text": text[:64], "url": url, "style": normalize_button_style(style)}
+    style = normalize_button_style(style)
+    prefix = _STYLE_EMOJI_PREFIX.get(style, "")
+    label = text[:64] if text.startswith(tuple(p for p in _STYLE_EMOJI_PREFIX.values() if p)) else f"{prefix}{text}"[:64]
+    kwargs = {"text": label, "url": url}
     if icon_custom_emoji_id:
         kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
     return InlineKeyboardButton(**kwargs)
@@ -970,7 +964,10 @@ def _make_inline_button(text: str, url: str, style: Optional[str] = None,
 
 def _make_callback_button(text: str, callback_data: str, style: Optional[str] = None,
                           icon_custom_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
-    kwargs = {"text": text[:64], "callback_data": callback_data, "style": normalize_button_style(style)}
+    style = normalize_button_style(style)
+    prefix = _STYLE_EMOJI_PREFIX.get(style, "")
+    label = text[:64] if text.startswith(tuple(p for p in _STYLE_EMOJI_PREFIX.values() if p)) else f"{prefix}{text}"[:64]
+    kwargs = {"text": label, "callback_data": callback_data}
     if icon_custom_emoji_id:
         kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
     return InlineKeyboardButton(**kwargs)
